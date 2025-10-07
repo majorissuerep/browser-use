@@ -1762,6 +1762,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				# Take automatic full page screenshot if enabled
 				if auto_take_full_page_screenshot:
 					try:
+						await asyncio.sleep(5)
 						await self._take_full_page_screenshot_auto()
 					except Exception as e:
 						self.logger.debug(f'Failed to take automatic full page screenshot after step {step + 1}: {e}')
