@@ -1693,6 +1693,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		on_step_start: AgentHookFunc | None = None,
 		on_step_end: AgentHookFunc | None = None,
 		auto_take_full_page_screenshot: bool = True,
+		full_page_screenshot_similarity_threshold: float = 0.99,
 	) -> AgentHistoryList[AgentStructuredOutput]:
 		"""Execute the task with maximum number of steps"""
 
@@ -1807,7 +1808,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 					try:
 						await asyncio.sleep(5)
 						self.logger.info('Taking automatic full page screenshot...')
-						await self._take_full_page_screenshot_auto()
+						await self._take_full_page_screenshot_auto(similarity_threshold=full_page_screenshot_similarity_threshold)
 					except Exception as e:
 						self.logger.info(f'Failed to take automatic full page screenshot after step {step + 1}: {e}')
 				if on_step_end is not None:
