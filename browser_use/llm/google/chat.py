@@ -9,7 +9,7 @@ from google import genai
 from google.auth.credentials import Credentials
 from google.genai import types
 from google.genai.types import MediaModality
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from browser_use.llm.base import BaseChatModel
 from browser_use.llm.exceptions import ModelProviderError
@@ -288,15 +288,21 @@ class ChatGoogle(BaseChatModel):
 
 									# Parse the JSON text and validate with the Pydantic model
 									parsed_data = json.loads(text)
-									return ChatInvokeCompletion(
-										completion=output_format.model_validate(parsed_data),
-										usage=usage,
-									)
-								except (json.JSONDecodeError, ValueError) as e:
+									try:
+										validated_output = output_format.model_validate(parsed_data)
+										return ChatInvokeCompletion(
+											completion=validated_output,
+											usage=usage,
+										)
+									except ValidationError as validation_err:
+										# Re-raise ValidationError so agent service can handle it with retries
+										self.logger.debug(f'🔄 Validation failed, letting agent service handle retry: {str(validation_err)}')
+										raise validation_err
+								except json.JSONDecodeError as e:
 									self.logger.error(f'❌ Failed to parse JSON response: {str(e)}')
 									self.logger.debug(f'Raw response text: {response.text[:200]}...')
 									raise ModelProviderError(
-										message=f'Failed to parse or validate response {response}: {str(e)}',
+										message=f'Failed to parse JSON from response: {str(e)}',
 										status_code=500,
 										model=self.model,
 									) from e
@@ -316,10 +322,16 @@ class ChatGoogle(BaseChatModel):
 							)
 						else:
 							# If it's not the expected type, try to validate it
-							return ChatInvokeCompletion(
-								completion=output_format.model_validate(response.parsed),
-								usage=usage,
-							)
+							try:
+								validated_output = output_format.model_validate(response.parsed)
+								return ChatInvokeCompletion(
+									completion=validated_output,
+									usage=usage,
+								)
+							except ValidationError as validation_err:
+								# Re-raise ValidationError so agent service can handle it with retries
+								self.logger.debug(f'🔄 Validation failed on parsed response, letting agent service handle retry: {str(validation_err)}')
+								raise validation_err
 					else:
 						# Fallback: Request JSON in the prompt for models without native JSON mode
 						self.logger.debug(f'🔄 Using fallback JSON mode for {output_format.__name__}')
@@ -366,11 +378,17 @@ class ChatGoogle(BaseChatModel):
 
 								# Parse and validate
 								parsed_data = json.loads(text)
-								return ChatInvokeCompletion(
-									completion=output_format.model_validate(parsed_data),
-									usage=usage,
-								)
-							except (json.JSONDecodeError, ValueError) as e:
+								try:
+									validated_output = output_format.model_validate(parsed_data)
+									return ChatInvokeCompletion(
+										completion=validated_output,
+										usage=usage,
+									)
+								except ValidationError as validation_err:
+									# Re-raise ValidationError so agent service can handle it with retries
+									self.logger.debug(f'🔄 Fallback validation failed, letting agent service handle retry: {str(validation_err)}')
+									raise validation_err
+							except json.JSONDecodeError as e:
 								self.logger.error(f'❌ Failed to parse fallback JSON: {str(e)}')
 								self.logger.debug(f'Raw response text: {response.text[:200]}...')
 								raise ModelProviderError(
