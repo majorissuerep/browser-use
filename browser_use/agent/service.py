@@ -469,7 +469,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		self._external_pause_event = asyncio.Event()
 		self._external_pause_event.set()
 
-	def _calculate_image_similarity(self, img1_bytes: bytes, img2_bytes: bytes, similarity_threshold: float = 0.95) -> float:
+	def _calculate_image_similarity(self, img1_bytes: bytes, img2_bytes: bytes, similarity_threshold: float = 0.99) -> float:
 		"""Calculate similarity between two images accounting for minor shifts and changes.
 		
 		Returns a similarity score between 0.0 and 1.0, where 1.0 means identical images.
@@ -570,7 +570,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			# If any error occurs in image processing, fall back to assuming different
 			return 0.0
 
-	def _find_similar_screenshots(self, new_image_bytes: bytes, similarity_threshold: float = 0.95) -> Path | None:
+	def _find_similar_screenshots(self, new_image_bytes: bytes, similarity_threshold: float = 0.99) -> Path | None:
 		"""Find if a similar screenshot already exists in the full_page directory.
 		
 		Returns the path of a similar existing screenshot, or None if no similar image found.
@@ -593,12 +593,11 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		
 		return None
 
-	async def _take_full_page_screenshot_auto(self) -> str | None:
+	async def _take_full_page_screenshot_auto(self, similarity_threshold=0.99) -> str | None:
 		"""Automatically take a full page screenshot and save to configured directory.
 		
 		Includes duplicate detection - if the screenshot is very similar to an existing one,
 		it won't be saved and None will be returned.
-		
 		Returns the path to the saved screenshot, or None if screenshot fails, is duplicate, 
 		or directory not configured.
 		"""
@@ -676,7 +675,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			
 			screenshot_bytes = base64.b64decode(data_b64)			
 			# Check for similar screenshots before saving
-			similar_file = self._find_similar_screenshots(screenshot_bytes)
+			similar_file = self._find_similar_screenshots(screenshot_bytes, similarity_threshold=similarity_threshold)
 			
 			if similar_file:
 				self.logger.info(f'🔄 Automatic screenshot very similar to existing file {similar_file.name}, skipping save')
