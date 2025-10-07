@@ -184,8 +184,13 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		sample_images: list[ContentPartTextParam | ContentPartImageParam] | None = None,
 		final_response_after_failure: bool = True,
 		_url_shortening_limit: int = 25,
+		full_page_screenshot_dir: str | Path | None = None,
 		**kwargs,
 	):
+		# Full page screenshot directory
+		self.full_page_screenshot_dir = Path(full_page_screenshot_dir) if full_page_screenshot_dir else None
+		if self.full_page_screenshot_dir:
+			self.full_page_screenshot_dir.mkdir(parents=True, exist_ok=True)
 		if llm is None:
 			default_llm_name = CONFIG.DEFAULT_LLM
 			if default_llm_name:
@@ -463,6 +468,229 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		# Event-based pause control (kept out of AgentState for serialization)
 		self._external_pause_event = asyncio.Event()
 		self._external_pause_event.set()
+
+	def _calculate_image_similarity(self, img1_bytes: bytes, img2_bytes: bytes, similarity_threshold: float = 0.95) -> float:
+		"""Calculate similarity between two images accounting for minor shifts and changes.
+		
+		Returns a similarity score between 0.0 and 1.0, where 1.0 means identical images.
+		Uses multiple comparison methods to handle shifts, minor changes, etc.
+		"""
+		try:
+			from PIL import Image
+			import io
+			import numpy as np
+			
+			# Load images
+			img1 = Image.open(io.BytesIO(img1_bytes)).convert('RGB')
+			img2 = Image.open(io.BytesIO(img2_bytes)).convert('RGB')
+			
+			# If dimensions are very different, they're definitely different
+			if abs(img1.width - img2.width) > 50 or abs(img1.height - img2.height) > 50:
+				return 0.0
+			
+			# Resize both images to same size for comparison (use smaller dimensions)
+			target_width = min(img1.width, img2.width)
+			target_height = min(img1.height, img2.height)
+			
+			# Resize to common size for comparison
+			img1_resized = img1.resize((target_width, target_height), Image.Resampling.LANCZOS)
+			img2_resized = img2.resize((target_width, target_height), Image.Resampling.LANCZOS)
+			
+			# Convert to numpy arrays for efficient computation
+			arr1 = np.array(img1_resized, dtype=np.float32)
+			arr2 = np.array(img2_resized, dtype=np.float32)
+			
+			# Method 1: Direct pixel comparison (normalized)
+			direct_diff = np.mean(np.abs(arr1 - arr2)) / 255.0
+			direct_similarity = 1.0 - direct_diff
+			
+			# Method 2: Check for small shifts (±5 pixels in each direction)
+			max_shift_similarity = direct_similarity
+			for dx in range(-5, 6, 2):
+				for dy in range(-5, 6, 2):
+					if dx == 0 and dy == 0:
+						continue
+					
+					# Calculate bounds for shifted comparison
+					x1_start = max(0, dx)
+					x1_end = min(target_width, target_width + dx)
+					y1_start = max(0, dy)
+					y1_end = min(target_height, target_height + dy)
+					
+					x2_start = max(0, -dx)
+					x2_end = min(target_width, target_width - dx)
+					y2_start = max(0, -dy)
+					y2_end = min(target_height, target_height - dy)
+					
+					# Extract overlapping regions
+					region1 = arr1[y1_start:y1_end, x1_start:x1_end]
+					region2 = arr2[y2_start:y2_end, x2_start:x2_end]
+					
+					if region1.size > 0 and region2.size > 0 and region1.shape == region2.shape:
+						shift_diff = np.mean(np.abs(region1 - region2)) / 255.0
+						shift_similarity = 1.0 - shift_diff
+						max_shift_similarity = max(max_shift_similarity, shift_similarity)
+			
+			# Method 3: Histogram comparison (for color distribution similarity)
+			hist1_r = np.histogram(arr1[:,:,0], bins=32, range=(0, 255))[0]
+			hist1_g = np.histogram(arr1[:,:,1], bins=32, range=(0, 255))[0]
+			hist1_b = np.histogram(arr1[:,:,2], bins=32, range=(0, 255))[0]
+			
+			hist2_r = np.histogram(arr2[:,:,0], bins=32, range=(0, 255))[0]
+			hist2_g = np.histogram(arr2[:,:,1], bins=32, range=(0, 255))[0]
+			hist2_b = np.histogram(arr2[:,:,2], bins=32, range=(0, 255))[0]
+			
+			# Normalize histograms
+			hist1_r = hist1_r / np.sum(hist1_r)
+			hist1_g = hist1_g / np.sum(hist1_g)
+			hist1_b = hist1_b / np.sum(hist1_b)
+			hist2_r = hist2_r / np.sum(hist2_r)
+			hist2_g = hist2_g / np.sum(hist2_g)
+			hist2_b = hist2_b / np.sum(hist2_b)
+			
+			# Calculate histogram similarity using correlation
+			hist_sim_r = np.corrcoef(hist1_r, hist2_r)[0, 1]
+			hist_sim_g = np.corrcoef(hist1_g, hist2_g)[0, 1]
+			hist_sim_b = np.corrcoef(hist1_b, hist2_b)[0, 1]
+			
+			# Handle NaN values (when histograms are constant)
+			hist_sim_r = 0.0 if np.isnan(hist_sim_r) else max(0.0, hist_sim_r)
+			hist_sim_g = 0.0 if np.isnan(hist_sim_g) else max(0.0, hist_sim_g)
+			hist_sim_b = 0.0 if np.isnan(hist_sim_b) else max(0.0, hist_sim_b)
+			
+			histogram_similarity = (hist_sim_r + hist_sim_g + hist_sim_b) / 3.0
+			
+			# Combine similarity scores with weights
+			# Prioritize shift-aware pixel comparison, but also consider histogram
+			final_similarity = (max_shift_similarity * 0.8) + (histogram_similarity * 0.2)
+			
+			return min(1.0, max(0.0, final_similarity))
+			
+		except Exception:
+			# If any error occurs in image processing, fall back to assuming different
+			return 0.0
+
+	def _find_similar_screenshots(self, new_image_bytes: bytes, similarity_threshold: float = 0.95) -> Path | None:
+		"""Find if a similar screenshot already exists in the full_page directory.
+		
+		Returns the path of a similar existing screenshot, or None if no similar image found.
+		"""
+		if not self.full_page_screenshot_dir:
+			return None
+			
+		for png_file in self.full_page_screenshot_dir.glob("*.png"):
+			try:
+				with open(png_file, 'rb') as f:
+					existing_image_bytes = f.read()
+				
+				similarity = self._calculate_image_similarity(new_image_bytes, existing_image_bytes, similarity_threshold)
+				
+				if similarity >= similarity_threshold:
+					return png_file
+					
+			except Exception:
+				continue  # Skip files that can't be read or processed
+		
+		return None
+
+	async def _take_full_page_screenshot_auto(self) -> str | None:
+		"""Automatically take a full page screenshot and save to configured directory.
+		
+		Includes duplicate detection - if the screenshot is very similar to an existing one,
+		it won't be saved and None will be returned.
+		
+		Returns the path to the saved screenshot, or None if screenshot fails, is duplicate, 
+		or directory not configured.
+		"""
+		if not self.full_page_screenshot_dir:
+			return None
+			
+		if not self.browser_session or not hasattr(self.browser_session, 'agent_focus'):
+			self.logger.debug('Cannot take full page screenshot: browser not connected')
+			return None
+			
+		try:
+			import base64
+			import glob
+			
+			cdp_session = self.browser_session.agent_focus
+			if cdp_session is None:
+				return None
+				
+			cdp_client = cdp_session.cdp_client
+			sid = cdp_session.session_id
+
+			# Get layout metrics as a baseline
+			metrics = await cdp_client.send.Page.getLayoutMetrics(session_id=sid)
+			content_size = metrics.get("contentSize", {})
+			full_width = int(content_size.get("width", 0)) or 0
+			full_height = int(content_size.get("height", 0)) or 0
+
+			try:
+				scroll_eval = await cdp_client.send.Runtime.evaluate(
+					params={
+						"expression": "({w: Math.max(document.documentElement.scrollWidth, document.body.scrollWidth), h: Math.max(document.documentElement.scrollHeight, document.body.scrollHeight)})",
+						"returnByValue": True,
+					},
+					session_id=sid,
+				)
+				scroll_val = (scroll_eval or {}).get("result", {}).get("value", {})
+				scroll_w = int(scroll_val.get("w", 0)) or full_width
+				scroll_h = int(scroll_val.get("h", 0)) or full_height
+				# Prefer scroll-detected dimensions when reasonable
+				if scroll_h > 0:
+					if full_height == 0 or full_height > scroll_h * 1.5:
+						full_height = scroll_h
+					else:
+						full_height = max(full_height, scroll_h)
+				if scroll_w > 0:
+					full_width = max(full_width, scroll_w)
+			except Exception:
+				pass
+
+			# Safety clamps
+			if full_height > 12000:
+				full_height = 12000
+			if full_width > 30000:
+				full_width = 30000
+
+			if full_width <= 0 or full_height <= 0:
+				shot = await cdp_client.send.Page.captureScreenshot(
+					params={"format": "png"}, session_id=sid
+				)
+			else:
+				shot = await cdp_client.send.Page.captureScreenshot(
+					params={
+						"format": "png",
+						"captureBeyondViewport": True,
+						"fromSurface": True,
+						"clip": {"x": 0, "y": 0, "width": full_width, "height": full_height, "scale": 1},
+					},
+					session_id=sid,
+				)
+			
+			data_b64 = shot.get("data")
+			if not data_b64:
+				self.logger.debug('Full page screenshot failed: no data returned')
+				return None
+			
+			screenshot_bytes = base64.b64decode(data_b64)			
+			# Check for similar screenshots before saving
+			similar_file = self._find_similar_screenshots(screenshot_bytes)
+			
+			if similar_file:
+				self.logger.debug(f'🔄 Automatic screenshot very similar to existing file {similar_file.name}, skipping save')
+				return None
+			
+			files = glob.glob(str(self.full_page_screenshot_dir / "*.png"))
+			path = self.full_page_screenshot_dir / f"full_page_{len(files):03d}.png"
+			path.write_bytes(screenshot_bytes)
+			self.logger.debug(f'📸 Automatic full page screenshot saved to {path} (size: {full_width}x{full_height})')
+			return str(path)
+			
+		except Exception as e:
+			self.logger.debug(f'Failed to take automatic full page screenshot: {e}')
+			return None
 
 	@property
 	def logger(self) -> logging.Logger:
@@ -1421,6 +1649,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		max_steps: int = 100,
 		on_step_start: AgentHookFunc | None = None,
 		on_step_end: AgentHookFunc | None = None,
+		auto_take_full_page_screenshot: bool = True,
 	) -> AgentHistoryList[AgentStructuredOutput]:
 		"""Execute the task with maximum number of steps"""
 
@@ -1529,7 +1758,13 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 					self.logger.error(f'⏰ {error_msg}')
 					self.state.consecutive_failures += 1
 					self.state.last_result = [ActionResult(error=error_msg)]
-
+				
+				# Take automatic full page screenshot if enabled
+				if auto_take_full_page_screenshot:
+					try:
+						await self._take_full_page_screenshot_auto()
+					except Exception as e:
+						self.logger.debug(f'Failed to take automatic full page screenshot after step {step + 1}: {e}')
 				if on_step_end is not None:
 					await on_step_end(self)
 
