@@ -164,27 +164,44 @@ class SchemaOptimizer:
 	@staticmethod
 	def create_gemini_optimized_schema(model: type[BaseModel]) -> dict[str, Any]:
 		"""
-		Create Gemini-optimized schema that removes 'required' arrays to save tokens.
-		Gemini can infer required fields from context since all fields are required.
+		Create Gemini-optimized schema that preserves critical required fields.
+		We preserve required arrays for important fields like 'action' to ensure 
+		the model doesn't treat them as optional.
 
 		Args:
 			model: The Pydantic model to optimize
 
 		Returns:
-			Optimized schema without required arrays
+			Optimized schema with critical required fields preserved
 		"""
 		# Start with standard optimized schema
 		schema = SchemaOptimizer.create_optimized_json_schema(model)
 
-		def remove_required_arrays(obj: Any) -> Any:
-			"""Recursively remove 'required' arrays"""
+		def optimize_required_arrays(obj: Any) -> Any:
+			"""Preserve critical required fields but remove less important ones"""
 			if isinstance(obj, dict):
-				# Remove 'required' key
-				result = {k: v for k, v in obj.items() if k != 'required'}
+				result = obj.copy()
+				
+				# Only remove 'required' arrays for non-critical objects
+				# Always preserve 'required' at the top level and for objects with 'action' field
+				if 'required' in result and 'properties' in result:
+					properties = result.get('properties', {})
+					# Keep required array if it contains critical fields like 'action'
+					required_fields = result.get('required', [])
+					critical_fields = {'action', 'evaluation_previous_goal', 'memory', 'next_goal'}
+					
+					# If this object has any critical fields, preserve the required array
+					if any(field in critical_fields for field in required_fields):
+						# Keep the required array as-is for critical objects
+						pass
+					else:
+						# For non-critical objects, we can still remove required to save tokens
+						result = {k: v for k, v in result.items() if k != 'required'}
+				
 				# Recursively process nested structures
-				return {k: remove_required_arrays(v) for k, v in result.items()}
+				return {k: optimize_required_arrays(v) for k, v in result.items()}
 			elif isinstance(obj, list):
-				return [remove_required_arrays(item) for item in obj]
+				return [optimize_required_arrays(item) for item in obj]
 			return obj
 
-		return remove_required_arrays(schema)
+		return optimize_required_arrays(schema)

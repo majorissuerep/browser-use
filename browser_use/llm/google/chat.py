@@ -271,67 +271,42 @@ class ChatGoogle(BaseChatModel):
 
 						usage = self._get_usage(response)
 
-						# Handle case where response.parsed might be None
-						if response.parsed is None:
-							self.logger.debug('📝 Parsing JSON from text response')
-							# When using response_schema, Gemini returns JSON as text
-							if response.text:
-								try:
-									# Handle JSON wrapped in markdown code blocks (common Gemini behavior)
-									text = response.text.strip()
-									if text.startswith('```json') and text.endswith('```'):
-										text = text[7:-3].strip()
-										self.logger.debug('🔧 Stripped ```json``` wrapper from response')
-									elif text.startswith('```') and text.endswith('```'):
-										text = text[3:-3].strip()
-										self.logger.debug('🔧 Stripped ``` wrapper from response')
+						# Handle response text parsing - simplified like OpenAI
+						if not response.text:
+							self.logger.error('❌ No response text received')
+							raise ModelProviderError(
+								message=f'No response from model {response}',
+								status_code=500,
+								model=self.model,
+							)
 
-									# Parse the JSON text and validate with the Pydantic model
-									parsed_data = json.loads(text)
-									try:
-										validated_output = output_format.model_validate(parsed_data)
-										return ChatInvokeCompletion(
-											completion=validated_output,
-											usage=usage,
-										)
-									except ValidationError as validation_err:
-										# Re-raise ValidationError so agent service can handle it with retries
-										self.logger.debug(f'🔄 Validation failed, letting agent service handle retry: {str(validation_err)}')
-										raise validation_err
-								except json.JSONDecodeError as e:
-									self.logger.error(f'❌ Failed to parse JSON response: {str(e)}')
-									self.logger.debug(f'Raw response text: {response.text[:200]}...')
-									raise ModelProviderError(
-										message=f'Failed to parse JSON from response: {str(e)}',
-										status_code=500,
-										model=self.model,
-									) from e
-							else:
-								self.logger.error('❌ No response text received')
-								raise ModelProviderError(
-									message=f'No response from model {response}',
-									status_code=500,
-									model=self.model,
-								)
+						# Clean up response text (handle markdown wrappers)
+						text = response.text.strip()
+						if text.startswith('```json') and text.endswith('```'):
+							text = text[7:-3].strip()
+							self.logger.debug('🔧 Stripped ```json``` wrapper from response')
+						elif text.startswith('```') and text.endswith('```'):
+							text = text[3:-3].strip()
+							self.logger.debug('🔧 Stripped ``` wrapper from response')
 
-						# Ensure we return the correct type
-						if isinstance(response.parsed, output_format):
+						# Use model_validate_json like OpenAI - this is the most reliable approach
+						try:
+							parsed = output_format.model_validate_json(text)
 							return ChatInvokeCompletion(
-								completion=response.parsed,
+								completion=parsed,
 								usage=usage,
 							)
-						else:
-							# If it's not the expected type, try to validate it
-							try:
-								validated_output = output_format.model_validate(response.parsed)
-								return ChatInvokeCompletion(
-									completion=validated_output,
-									usage=usage,
-								)
-							except ValidationError as validation_err:
-								# Re-raise ValidationError so agent service can handle it with retries
-								self.logger.debug(f'🔄 Validation failed on parsed response, letting agent service handle retry: {str(validation_err)}')
-								raise validation_err
+						except ValidationError:
+							# Re-raise ValidationError so agent service can handle retries
+							raise
+						except (json.JSONDecodeError, ValueError) as e:
+							self.logger.error(f'❌ Failed to parse JSON response: {str(e)}')
+							self.logger.debug(f'Raw response text: {text[:200]}...')
+							raise ModelProviderError(
+								message=f'Failed to parse or validate response: {str(e)}',
+								status_code=500,
+								model=self.model,
+							) from e
 					else:
 						# Fallback: Request JSON in the prompt for models without native JSON mode
 						self.logger.debug(f'🔄 Using fallback JSON mode for {output_format.__name__}')
@@ -365,44 +340,39 @@ class ChatGoogle(BaseChatModel):
 						usage = self._get_usage(response)
 
 						# Try to extract JSON from the text response
-						if response.text:
-							try:
-								# Try to find JSON in the response
-								text = response.text.strip()
-
-								# Common patterns: JSON wrapped in markdown code blocks
-								if text.startswith('```json') and text.endswith('```'):
-									text = text[7:-3].strip()
-								elif text.startswith('```') and text.endswith('```'):
-									text = text[3:-3].strip()
-
-								# Parse and validate
-								parsed_data = json.loads(text)
-								try:
-									validated_output = output_format.model_validate(parsed_data)
-									return ChatInvokeCompletion(
-										completion=validated_output,
-										usage=usage,
-									)
-								except ValidationError as validation_err:
-									# Re-raise ValidationError so agent service can handle it with retries
-									self.logger.debug(f'🔄 Fallback validation failed, letting agent service handle retry: {str(validation_err)}')
-									raise validation_err
-							except json.JSONDecodeError as e:
-								self.logger.error(f'❌ Failed to parse fallback JSON: {str(e)}')
-								self.logger.debug(f'Raw response text: {response.text[:200]}...')
-								raise ModelProviderError(
-									message=f'Model does not support JSON mode and failed to parse JSON from text response: {str(e)}',
-									status_code=500,
-									model=self.model,
-								) from e
-						else:
+						if not response.text:
 							self.logger.error('❌ No response text in fallback mode')
 							raise ModelProviderError(
 								message='No response from model',
 								status_code=500,
 								model=self.model,
 							)
+
+						# Clean up response text (handle markdown wrappers)
+						text = response.text.strip()
+						if text.startswith('```json') and text.endswith('```'):
+							text = text[7:-3].strip()
+						elif text.startswith('```') and text.endswith('```'):
+							text = text[3:-3].strip()
+
+						# Use model_validate_json like OpenAI - this is the most reliable approach
+						try:
+							parsed = output_format.model_validate_json(text)
+							return ChatInvokeCompletion(
+								completion=parsed,
+								usage=usage,
+							)
+						except ValidationError:
+							# Re-raise ValidationError so agent service can handle retries
+							raise
+						except (json.JSONDecodeError, ValueError) as e:
+							self.logger.error(f'❌ Failed to parse fallback JSON: {str(e)}')
+							self.logger.debug(f'Raw response text: {text[:200]}...')
+							raise ModelProviderError(
+								message=f'Model does not support JSON mode and failed to parse JSON from text response: {str(e)}',
+								status_code=500,
+								model=self.model,
+							) from e
 			except Exception as e:
 				elapsed = time.time() - start_time
 				self.logger.error(f'💥 API call failed after {elapsed:.2f}s: {type(e).__name__}: {e}')
@@ -414,6 +384,9 @@ class ChatGoogle(BaseChatModel):
 			self.logger.debug(f'🔄 Making API call to {self.model} (using built-in retry)')
 			return await _make_api_call()
 
+		except ValidationError:
+			# Let ValidationError pass through to agent service for retry handling
+			raise
 		except Exception as e:
 			# Handle specific Google API errors with enhanced diagnostics
 			error_message = str(e)
