@@ -671,7 +671,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			
 			data_b64 = shot.get("data")
 			if not data_b64:
-				self.logger.debug('Full page screenshot failed: no data returned')
+				self.logger.info('Full page screenshot failed: no data returned')
 				return None
 			
 			screenshot_bytes = base64.b64decode(data_b64)			
@@ -679,7 +679,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			similar_file = self._find_similar_screenshots(screenshot_bytes)
 			
 			if similar_file:
-				self.logger.debug(f'🔄 Automatic screenshot very similar to existing file {similar_file.name}, skipping save')
+				self.logger.info(f'🔄 Automatic screenshot very similar to existing file {similar_file.name}, skipping save')
 				return None
 			
 			files = glob.glob(str(self.full_page_screenshot_dir / "*.png"))
@@ -689,7 +689,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			return str(path)
 			
 		except Exception as e:
-			self.logger.debug(f'Failed to take automatic full page screenshot: {e}')
+			self.logger.info(f'Failed to take automatic full page screenshot: {e}')
 			return None
 
 	@property
@@ -1136,37 +1136,81 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 
 	async def _get_model_output_with_retry(self, input_messages: list[BaseMessage]) -> AgentOutput:
 		"""Get model output with retry logic for empty actions"""
-		model_output = await self.get_model_output(input_messages)
-		self.logger.debug(
-			f'✅ Step {self.state.n_steps}: Got LLM response with {len(model_output.action) if model_output.action else 0} actions'
-		)
+		try:
+			model_output = await self.get_model_output(input_messages)
+			self.logger.debug(
+				f'✅ Step {self.state.n_steps}: Got LLM response with {len(model_output.action) if model_output.action else 0} actions'
+			)
 
-		if (
-			not model_output.action
-			or not isinstance(model_output.action, list)
-			or all(action.model_dump() == {} for action in model_output.action)
-		):
-			self.logger.warning('Model returned empty action. Retrying...')
+			if (
+				not model_output.action
+				or not isinstance(model_output.action, list)
+				or all(action.model_dump() == {} for action in model_output.action)
+			):
+				self.logger.warning('Model returned empty action. Retrying...')
+
+				clarification_message = UserMessage(
+					content='You forgot to return an action. Please respond with a valid JSON action according to the expected schema with your assessment and next actions.'
+				)
+
+				retry_messages = input_messages + [clarification_message]
+				model_output = await self.get_model_output(retry_messages)
+
+				if not model_output.action or all(action.model_dump() == {} for action in model_output.action):
+					self.logger.warning('Model still returned empty after retry. Inserting safe noop action.')
+					action_instance = self.ActionModel()
+					setattr(
+						action_instance,
+						'done',
+						{
+							'success': False,
+							'text': 'No next action returned by LLM!',
+						},
+					)
+					model_output.action = [action_instance]
+
+		except ValidationError as e:
+			# Handle cases where the model response is missing required fields like 'action'
+			self.logger.warning(f'Model response validation failed: {str(e)}. Retrying with clarification...')
 
 			clarification_message = UserMessage(
-				content='You forgot to return an action. Please respond with a valid JSON action according to the expected schema with your assessment and next actions.'
+				content='Your previous response was missing required fields. Please respond with a complete JSON response including all required fields according to the expected schema, especially the "action" field with your next actions.'
 			)
 
 			retry_messages = input_messages + [clarification_message]
-			model_output = await self.get_model_output(retry_messages)
-
-			if not model_output.action or all(action.model_dump() == {} for action in model_output.action):
-				self.logger.warning('Model still returned empty after retry. Inserting safe noop action.')
+			try:
+				model_output = await self.get_model_output(retry_messages)
+				self.logger.debug(
+					f'✅ Step {self.state.n_steps}: Got LLM retry response with {len(model_output.action) if model_output.action else 0} actions'
+				)
+			except ValidationError as retry_error:
+				self.logger.warning(f'Model still returned invalid response after retry: {str(retry_error)}. Inserting safe noop action.')
+				# Create a minimal valid response with a done action
 				action_instance = self.ActionModel()
 				setattr(
 					action_instance,
 					'done',
 					{
 						'success': False,
-						'text': 'No next action returned by LLM!',
+						'text': f'Model validation failed: {str(retry_error)}',
 					},
 				)
-				model_output.action = [action_instance]
+				# Create a valid AgentOutput with required fields
+				if self.settings.use_thinking:
+					model_output = self.AgentOutput(
+						thinking='Model response validation failed, inserted fallback action.',
+						evaluation_previous_goal='Error in model response',
+						memory='',
+						next_goal='Attempting to recover from validation error',
+						action=[action_instance]
+					)
+				else:
+					model_output = self.AgentOutput(
+						evaluation_previous_goal='Error in model response',
+						memory='',
+						next_goal='Attempting to recover from validation error',
+						action=[action_instance]
+					)
 
 		return model_output
 
@@ -1763,9 +1807,10 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				if auto_take_full_page_screenshot:
 					try:
 						await asyncio.sleep(5)
+						self.logger.info('Taking automatic full page screenshot...')
 						await self._take_full_page_screenshot_auto()
 					except Exception as e:
-						self.logger.debug(f'Failed to take automatic full page screenshot after step {step + 1}: {e}')
+						self.logger.info(f'Failed to take automatic full page screenshot after step {step + 1}: {e}')
 				if on_step_end is not None:
 					await on_step_end(self)
 
